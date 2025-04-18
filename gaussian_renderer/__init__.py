@@ -102,7 +102,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     if render_color:
-        rendered_image, radii, rendered_depth, rendered_alpha = rasterizer(
+        # For 2DGS, allmap contains rendered depth and alpha
+        rendered_image, radii, allmap = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -111,6 +112,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+        rendered_alpha = allmap[1:2]
+
+        rendered_depth = allmap[0:1]
+        rendered_depth = (rendered_depth / rendered_alpha)
+        rendered_depth = torch.nan_to_num(rendered_depth, 0, 0)
     else:
         rendered_image, radii, rendered_depth, rendered_alpha = None, None, None, None
 
@@ -127,7 +133,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # get feature
         ins_feat = (pc.get_ins_feat(origin=origin_feat) + 1) / 2   # pseudo -> norm, else -> raw
         # first three channels
-        rendered_ins_feat, _, _, _ = rasterizer(
+        rendered_ins_feat, _, _ = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = None,
@@ -139,7 +145,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
         # last three channels
         if ins_feat.shape[-1] > 3:
-            rendered_ins_feat2, _, _, _ = rasterizer(
+            rendered_ins_feat2, _, _ = rasterizer(
                 means3D = means3D,
                 means2D = means2D,
                 shs = None,
@@ -151,7 +157,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 cov3D_precomp = cov3D_precomp)
             rendered_ins_feat = torch.cat((rendered_ins_feat, rendered_ins_feat2), dim=0)
         # mask
-        _, _, _, silhouette = rasterizer(
+        _, _, allmap = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -162,6 +168,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # scales = scales*0+0.001,   # *0.1
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+
+        silhouette = allmap[1:2]
     else:
         rendered_ins_feat, silhouette = None, None
 
@@ -201,7 +209,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     continue
                     
             # render cluster-level feat map
-            rendered_cluster, _, _, cluster_silhouette = rasterizer(
+            rendered_cluster, _, allmap  = rasterizer(
                 means3D = means3D[filter_idx],
                 means2D = means2D[filter_idx],
                 shs = None,  # feat
@@ -212,8 +220,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 scales = scales[filter_idx] * rescale_factor,
                 rotations = rotations[filter_idx],
                 cov3D_precomp = cov3D_precomp)
+            cluster_silhouette = allmap[1:2]
+
             if ins_feat.shape[-1] > 3:
-                rendered_cluster2, _, _, cluster_silhouette = rasterizer(
+                rendered_cluster2, _, allmap = rasterizer(
                     means3D = means3D[filter_idx],
                     means2D = means2D[filter_idx],
                     shs = None,           # feat
@@ -225,6 +235,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     rotations = rotations[filter_idx],
                     cov3D_precomp = cov3D_precomp)
                 rendered_cluster = torch.cat((rendered_cluster, rendered_cluster2), dim=0)
+
+                cluster_silhouette = allmap[1:2]
 
             # alpha --> mask
             if cluster_silhouette.max() > 0.8:
@@ -325,7 +337,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 _colors_precomp1 = ins_feat[:, :3][filter_idx]
                 _colors_precomp2 = ins_feat[:, 3:][filter_idx]
             
-            rendered_leaf_cluster, _, _, leaf_cluster_silhouette = rasterizer(
+            rendered_leaf_cluster, _, allmap = rasterizer(
                 means3D = means3D[filter_idx],
                 means2D = means2D[filter_idx],
                 shs = _shs,                          # rgb or feat
@@ -334,8 +346,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 scales = (scales * re_scale_factor)[filter_idx],
                 rotations = rotations[filter_idx],
                 cov3D_precomp = cov3D_precomp)
+
+            leaf_cluster_silhouette = allmap[1:2]
             if ins_feat.shape[-1] > 3:
-                rendered_leaf_cluster2, _, _, _ = rasterizer(
+                rendered_leaf_cluster2, _, allmap = rasterizer(
                     means3D = means3D[filter_idx],
                     means2D = means2D[filter_idx],
                     shs = _shs,                          # rgb or feat
@@ -345,6 +359,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     rotations = rotations[filter_idx],
                     cov3D_precomp = cov3D_precomp)
                 rendered_leaf_cluster = torch.cat((rendered_leaf_cluster, rendered_leaf_cluster2), dim=0)
+
+                leaf_cluster_silhouette = allmap[1:2]
             rendered_leaf_clusters.append(rendered_leaf_cluster)
             rendered_leaf_cluster_silhouettes.append(leaf_cluster_silhouette)
             if selected_leaf_id is not None and len(rendered_leaf_clusters) > 0:
