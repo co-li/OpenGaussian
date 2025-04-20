@@ -17,6 +17,7 @@ from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRas
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.opengs_utlis import *
+from utils.point_utils import depth_to_normal
 # from sklearn.neighbors import NearestNeighbors
 import pytorch3d.ops
 
@@ -80,7 +81,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        # currently don't support normal consistency loss if use precomputed covariance
+        splat2world = pc.get_covariance(scaling_modifier)
+        W, H = viewpoint_camera.image_width, viewpoint_camera.image_height
+        near, far = viewpoint_camera.znear, viewpoint_camera.zfar
+        ndc2pix = torch.tensor([
+            [W / 2, 0, 0, (W-1) / 2],
+            [0, H / 2, 0, (H-1) / 2],
+            [0, 0, far-near, near],
+            [0, 0, 0, 1]]).float().cuda().T
+        world2pix =  viewpoint_camera.full_proj_transform @ ndc2pix
+        cov3D_precomp = (splat2world[:, [0,1,3]] @ world2pix[:,[0,1,3]]).permute(0,2,1).reshape(-1, 9) # column major
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
@@ -112,13 +123,45 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
-        rendered_alpha = allmap[1:2]
 
-        rendered_depth = allmap[0:1]
-        rendered_depth = (rendered_depth / rendered_alpha)
-        rendered_depth = torch.nan_to_num(rendered_depth, 0, 0)
+        # additional regularizations
+        render_alpha = allmap[1:2]
+
+        # get normal map
+        # transform normal from view space to world space
+        render_normal = allmap[2:5]
+        render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
+
+        # get median depth map
+        render_depth_median = allmap[5:6]
+        render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
+
+        # get expected depth map
+        render_depth_expected = allmap[0:1]
+        render_depth_expected = (render_depth_expected / render_alpha)
+        render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
+
+        # get depth distortion map
+        render_dist = allmap[6:7]
+
+        # psedo surface attributes
+        # surf depth is either median or expected by setting depth_ratio to 1 or 0
+        # for bounded scene, use median depth, i.e., depth_ratio = 1;
+        # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+        surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
+
+        # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
+        surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
+        surf_normal = surf_normal.permute(2,0,1)
+        # remember to multiply with accum_alpha since render_normal is unnormalized.
+        surf_normal = surf_normal * (render_alpha).detach()
+
+        rendered_alpha = render_alpha
+        rendered_depth = render_depth_expected
     else:
         rendered_image, radii, rendered_depth, rendered_alpha = None, None, None, None
+        # 2DGS Regularization
+        render_dist, render_normal, surf_normal = None, None, None
 
     # ################################################################
     # [Stage 1, Stage 2.1] Render image-level instance feature map   #
@@ -377,6 +420,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     return {"render": rendered_image,
             "alpha": rendered_alpha,
             "depth": rendered_depth,    # not used
+            "rend_dist": render_dist,
+            "rend_normal": render_normal,
+            "surf_normal": surf_normal,
             "silhouette": silhouette,
             "ins_feat": rendered_ins_feat,          # image-level feat map
             "cluster_imgs": rendered_clusters,      # coarse cluster feat map/image
